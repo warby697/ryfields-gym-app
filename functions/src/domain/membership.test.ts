@@ -1,0 +1,3 @@
+import { describe,expect,it } from 'vitest'
+import { canTransitionMembership } from './membership.js'
+describe('membership lifecycle',()=>{it('allows payment activation and suspension',()=>{expect(canTransitionMembership('pending_payment','active')).toBe(true);expect(canTransitionMembership('active','suspended')).toBe(true);expect(canTransitionMembership('payment_failed','active')).toBe(true)});it('makes cancellation terminal',()=>{expect(canTransitionMembership('cancelled','active')).toBe(false);expect(canTransitionMembership('cancelled','pending_payment')).toBe(false)});it('does not allow arbitrary resets',()=>{expect(canTransitionMembership('active','pending_payment')).toBe(false);expect(canTransitionMembership('suspended','payment_failed')).toBe(false)})})

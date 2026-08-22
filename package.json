@@ -1,0 +1,41 @@
+{
+  "name": "ryfields-gym-management",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && tsc -p functions/tsconfig.json && vite build",
+    "preview": "vite preview",
+    "verify:firestore-schema": "node scripts/verify-firestore-schema.mjs",
+    "deploy:firestore-schema": "npm run verify:firestore-schema && firebase deploy --only firestore:rules,firestore:indexes --project ryfields-gym",
+    "setup:kiosk-account": "node scripts/create-kiosk-account.mjs",
+    "test": "vitest run functions/src/domain/membership.test.ts functions/src/domain/booking.test.ts functions/src/domain/teen.test.ts functions/src/callable/shop.test.ts functions/src/webhooks/gocardless.test.ts tests/netlify-api.test.ts tests/navigation.test.ts tests/capacity.test.ts tests/shop-events.test.ts tests/legacy-data.test.ts tests/prelaunch-safeguards.test.ts tests/operational-hardening.test.ts tests/kiosk-checkin.test.ts tests/event-ticket-quantity.test.ts",
+    "test:rules": "firebase emulators:exec --only firestore --project ryfields-rules-test \"vitest run tests/firestore.rules.test.ts\""
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "firebase": "latest",
+    "firebase-admin": "14.1.0",
+    "firebase-functions": "7.2.5",
+    "lucide-react": "latest",
+    "qrcode": "^1.5.4",
+    "react": "latest",
+    "react-dom": "latest",
+    "react-router-dom": "latest",
+    "workbox-window": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.1",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "firebase-tools": "^15.23.0",
+    "netlify-cli": "^26.2.0",
+    "typescript": "latest",
+    "vite": "latest",
+    "vite-plugin-pwa": "latest",
+    "vitest": "latest"
+  }
+}

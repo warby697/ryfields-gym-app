@@ -1,0 +1,151 @@
+import { FieldValue, getFirestore } from 'firebase-admin/firestore';
+import { HttpsError, onCall } from 'firebase-functions/v2/https';
+import { z } from 'zod';
+import { goCardlessAccessToken, goCardlessRequest } from '../services/gocardless.js';
+const schema = z.object({ memberId: z.string().min(1), productId: z.string().min(1).max(100), plannedVisitDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() });
+const products = { single: { name: 'Single class pass', amount: 500, credits: 1, fulfilmentType: 'class_credits' }, three: { name: '3 class passes', amount: 1500, credits: 3, fulfilmentType: 'class_credits' }, day: { name: 'Gym day pass', amount: 600, credits: 0, fulfilmentType: 'day_pass' } };
+function previousMonth(date) { const copy = new Date(date); const day = copy.getUTCDate(); copy.setUTCDate(1); copy.setUTCMonth(copy.getUTCMonth() - 1); const last = new Date(Date.UTC(copy.getUTCFullYear(), copy.getUTCMonth() + 1, 0)).getUTCDate(); copy.setUTCDate(Math.min(day, last)); return copy; }
+export function calculateUpgradeAmount(now, renewal) { const cycleStart = previousMonth(renewal), cycleDays = Math.round((renewal.getTime() - cycleStart.getTime()) / 86400000), remainingDays = Math.max(0, Math.ceil((renewal.getTime() - now.getTime()) / 86400000)), amountMinor = Math.max(50, Math.min(1500, Math.round(1500 * remainingDays / cycleDays))); return { amountMinor, remainingDays, cycleDays }; }
+async function upgradeQuote(member) { const subscriptionId = String(member.get('gocardlessSubscriptionId') || ''); if (!subscriptionId)
+    throw new HttpsError('failed-precondition', 'No active GoCardless subscription is linked to this membership.'); const [subscription, payments] = await Promise.all([goCardlessRequest(`/subscriptions/${subscriptionId}`), goCardlessRequest(`/payments?subscription=${encodeURIComponent(subscriptionId)}&limit=20`)]), today = new Date().toISOString().slice(0, 10), recentFloor = new Date(Date.now() - 10 * 86400000).toISOString().slice(0, 10), recent = payments.filter(payment => payment.charge_date >= recentFloor && payment.charge_date <= today).sort((a, b) => b.charge_date.localeCompare(a.charge_date))[0]; if (recent && ['pending_submission', 'submitted'].includes(recent.status))
+    throw new HttpsError('failed-precondition', `Your latest Direct Debit from ${recent.charge_date} is still being processed by GoCardless. We’ll reopen online upgrades automatically as soon as it is confirmed.`); if (recent && ['failed', 'cancelled', 'charged_back'].includes(recent.status))
+    throw new HttpsError('failed-precondition', 'Your latest Direct Debit needs attention before we can safely upgrade your membership. Please contact Paul or Becky and we’ll help sort it.'); const next = subscription.upcoming_payments?.find(p => new Date(`${p.charge_date}T12:00:00Z`).getTime() > Date.now()); if (!next)
+    throw new HttpsError('failed-precondition', 'We could not find the next GoCardless payment date.'); const renewal = new Date(`${next.charge_date}T12:00:00Z`), daysUntil = Math.ceil((renewal.getTime() - Date.now()) / 86400000); if (daysUntil < 6)
+    throw new HttpsError('failed-precondition', `Your next membership payment is within 6 days, so we’ve temporarily paused online upgrades to avoid charging you incorrectly. You can upgrade as soon as that payment has cleared (${next.charge_date}).`); const calculation = calculateUpgradeAmount(new Date(), renewal); return { ...calculation, renewalDate: next.charge_date, oldSubscriptionId: subscriptionId, mandateId: String(subscription.links?.mandate || member.get('gocardlessMandateId') || '') }; }
+const quoteSchema = z.object({ memberId: z.string().min(1) });
+export const previewGymPlusUpgrade = onCall({ enforceAppCheck: true, secrets: [goCardlessAccessToken] }, async (request) => { if (!request.auth)
+    throw new HttpsError('unauthenticated', 'Sign-in is required.'); const p = quoteSchema.safeParse(request.data); if (!p.success)
+    throw new HttpsError('invalid-argument', 'Invalid membership.'); const member = await getFirestore().collection('members').doc(p.data.memberId).get(); if (!member.exists)
+    throw new HttpsError('not-found', 'Member not found.'); if (member.get('authUid') !== request.auth.uid)
+    throw new HttpsError('permission-denied', 'You cannot view this upgrade.'); return upgradeQuote(member); });
+const orderStatusSchema = z.object({ memberId: z.string().min(1), sessionId: z.string().min(1).max(200) });
+export const getStripeShopOrderStatus = onCall({ enforceAppCheck: true }, async (request) => { if (!request.auth)
+    throw new HttpsError('unauthenticated', 'Sign-in is required.'); const p = orderStatusSchema.safeParse(request.data); if (!p.success)
+    throw new HttpsError('invalid-argument', 'Invalid checkout.'); const db = getFirestore(), member = await db.collection('members').doc(p.data.memberId).get(), order = await db.collection('shopOrders').doc(p.data.sessionId).get(); if (!member.exists || member.get('authUid') !== request.auth.uid || !order.exists || order.get('memberId') !== member.id)
+    throw new HttpsError('not-found', 'Checkout not found.'); return { status: String(order.get('status') || 'processing'), productId: String(order.get('productId') || ''), productName: String(order.get('productName') || 'your order'), fulfilmentType: String(order.get('fulfilmentType') || ''), amountMinor: Number(order.get('amountMinor') || 0) }; });
+export const createStripeShopCheckout = onCall({ enforceAppCheck: true, secrets: [goCardlessAccessToken] }, async (request) => {
+    if (!request.auth)
+        throw new HttpsError('unauthenticated', 'Sign-in is required.');
+    const parsed = schema.safeParse(request.data);
+    if (!parsed.success)
+        throw new HttpsError('invalid-argument', 'Shop item is invalid.');
+    const db = getFirestore(), member = await db.collection('members').doc(parsed.data.memberId).get();
+    if (!member.exists)
+        throw new HttpsError('not-found', 'Member not found.');
+    if (member.get('authUid') !== request.auth.uid)
+        throw new HttpsError('permission-denied', 'You cannot buy for this account.');
+    const isPlus = parsed.data.productId === 'plus', quote = isPlus ? await upgradeQuote(member) : null, builtIn = products[parsed.data.productId], savedSnap = !isPlus ? await db.collection('shopProducts').doc(parsed.data.productId).get() : null, saved = savedSnap?.exists ? savedSnap.data() : null, product = (isPlus ? null : saved || builtIn), amount = isPlus ? quote.amountMinor : Number(product?.amountMinor || product?.amount);
+    if (!amount)
+        throw new HttpsError('invalid-argument', 'Upgrade amount is missing.');
+    if (!isPlus && (!product || product.active === false))
+        throw new HttpsError('not-found', 'That shop item is unavailable.');
+    const secret = process.env.STRIPE_SECRET_KEY;
+    if (!secret)
+        throw new HttpsError('failed-precondition', 'Stripe checkout is not configured.');
+    const base = (process.env.CONTEXT === 'dev' ? 'http://localhost:8888' : process.env.APP_BASE_URL || 'http://localhost:8888').replace(/\/$/, '');
+    const credits = Number(product?.credits || 0), fulfilmentType = String(product?.fulfilmentType || 'manual'), name = String(product?.name || 'Shop item');
+    const plannedVisitDate = parsed.data.productId === 'day' ? (parsed.data.plannedVisitDate || '') : '';
+    const commonMetadata = { 'metadata[member_id]': member.id, 'metadata[product_id]': parsed.data.productId, 'metadata[product_name]': name, 'metadata[credit_qty]': String(credits), 'metadata[fulfilment_type]': fulfilmentType, 'metadata[planned_visit_date]': plannedVisitDate, 'metadata[renewal_date]': quote?.renewalDate || '', 'metadata[old_subscription_id]': quote?.oldSubscriptionId || '', 'metadata[mandate_id]': quote?.mandateId || '', 'payment_intent_data[metadata][member_id]': member.id, 'payment_intent_data[metadata][product_id]': parsed.data.productId, 'payment_intent_data[metadata][product_name]': name, 'payment_intent_data[metadata][credit_qty]': String(credits), 'payment_intent_data[metadata][fulfilment_type]': fulfilmentType, 'payment_intent_data[metadata][planned_visit_date]': plannedVisitDate, 'payment_intent_data[metadata][renewal_date]': quote?.renewalDate || '', 'payment_intent_data[metadata][old_subscription_id]': quote?.oldSubscriptionId || '', 'payment_intent_data[metadata][mandate_id]': quote?.mandateId || '' };
+    const form = new URLSearchParams({ 'mode': 'payment', 'success_url': `${base}/shop?checkout=success&session_id={CHECKOUT_SESSION_ID}`, 'cancel_url': `${base}/shop?checkout=cancelled`, 'customer_email': String(member.get('email') || ''), 'line_items[0][price_data][currency]': 'gbp', 'line_items[0][price_data][unit_amount]': String(amount), 'line_items[0][price_data][product_data][name]': isPlus ? 'Gym Plus pro-rata upgrade' : name, 'line_items[0][quantity]': '1', ...commonMetadata });
+    const response = await fetch('https://api.stripe.com/v1/checkout/sessions', { method: 'POST', headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/x-www-form-urlencoded' }, body: form });
+    if (!response.ok)
+        throw new HttpsError('internal', 'Stripe Checkout could not be started.');
+    const session = await response.json();
+    await db.collection('shopOrders').doc(session.id).set({ memberId: member.id, productId: parsed.data.productId, productName: name, fulfilmentType, amountMinor: amount, status: 'checkout_created', provider: 'stripe', plannedVisitDate: plannedVisitDate || null, upgradeQuote: quote || null, createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() });
+    return { url: session.url };
+});
+const eventCheckoutSchema = z.object({ memberId: z.string().min(1), eventId: z.string().min(1).max(200), returnToShop: z.boolean().default(false), quantity: z.number().int().min(1).max(10).default(1) });
+export const createStripeEventCheckout = onCall({ enforceAppCheck: true }, async (request) => {
+    if (!request.auth)
+        throw new HttpsError('unauthenticated', 'Sign-in is required.');
+    const parsed = eventCheckoutSchema.safeParse(request.data);
+    if (!parsed.success)
+        throw new HttpsError('invalid-argument', 'Event ticket is invalid.');
+    const db = getFirestore(), memberRef = db.collection('members').doc(parsed.data.memberId), eventRef = db.collection('events').doc(parsed.data.eventId), [member, event] = await Promise.all([memberRef.get(), eventRef.get()]);
+    if (!member.exists || member.get('authUid') !== request.auth.uid)
+        throw new HttpsError('permission-denied', 'You cannot buy for this account.');
+    if (!event.exists || event.get('active') === false)
+        throw new HttpsError('not-found', 'That event is unavailable.');
+    const amount = Number(event.get('ticketPriceMinor') || 0), sessionId = String(event.get('sessionId') || ''), quantity = parsed.data.quantity;
+    if (amount < 50 || !sessionId)
+        throw new HttpsError('failed-precondition', 'This event does not require paid checkout.');
+    const sessionRef = db.collection('classSessions').doc(sessionId), bookingRef = sessionRef.collection('bookings').doc(member.id), reservationRef = db.collection('eventTicketReservations').doc();
+    await db.runTransaction(async (transaction) => { const [session, booking] = await Promise.all([transaction.get(sessionRef), transaction.get(bookingRef)]); if (!session.exists || session.get('status') !== 'scheduled')
+        throw new HttpsError('failed-precondition', 'This event is not open.'); if (booking.exists && String(booking.get('status')) === 'waitlisted')
+        throw new HttpsError('failed-precondition', 'You are on the waiting list for this event.'); const capacity = Number(session.get('capacity') || 0), booked = Number(session.get('bookedCount') || 0), reserved = Number(session.get('reservedTickets') || 0), remaining = capacity - booked - reserved; if (remaining <= 0)
+        throw new HttpsError('resource-exhausted', 'This event has sold out.'); if (quantity > remaining)
+        throw new HttpsError('resource-exhausted', `Only ${remaining} ${remaining === 1 ? 'ticket is' : 'tickets are'} left.`); transaction.update(sessionRef, { reservedTickets: FieldValue.increment(quantity), updatedAt: FieldValue.serverTimestamp() }); transaction.create(reservationRef, { eventId: event.id, sessionId, memberId: member.id, status: 'reserved', quantity, amountMinor: amount * quantity, unitAmountMinor: amount, expiresAt: new Date(Date.now() + 31 * 60_000), createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() }); });
+    const secret = process.env.STRIPE_SECRET_KEY;
+    if (!secret)
+        throw new HttpsError('failed-precondition', 'Stripe checkout is not configured.');
+    const base = (process.env.CONTEXT === 'dev' ? 'http://localhost:8888' : process.env.APP_BASE_URL || 'http://localhost:8888').replace(/\/$/, '');
+    const metadata = { 'metadata[member_id]': member.id, 'metadata[product_id]': `event:${event.id}`, 'metadata[product_name]': String(event.get('title') || 'Event ticket'), 'metadata[fulfilment_type]': 'event_ticket', 'metadata[event_id]': event.id, 'metadata[event_session_id]': sessionId, 'metadata[reservation_id]': reservationRef.id, 'metadata[quantity]': String(quantity), 'payment_intent_data[metadata][member_id]': member.id, 'payment_intent_data[metadata][product_id]': `event:${event.id}`, 'payment_intent_data[metadata][product_name]': String(event.get('title') || 'Event ticket'), 'payment_intent_data[metadata][fulfilment_type]': 'event_ticket', 'payment_intent_data[metadata][event_id]': event.id, 'payment_intent_data[metadata][event_session_id]': sessionId, 'payment_intent_data[metadata][reservation_id]': reservationRef.id, 'payment_intent_data[metadata][quantity]': String(quantity) };
+    const returnContext = parsed.data.returnToShop ? '&returnTo=shop' : '';
+    const form = new URLSearchParams({ 'mode': 'payment', 'success_url': `${base}/?event=${encodeURIComponent(event.id)}&event_checkout=success&session_id={CHECKOUT_SESSION_ID}${returnContext}`, 'cancel_url': `${base}/?event=${encodeURIComponent(event.id)}&event_checkout=cancelled${returnContext}`, 'customer_email': String(member.get('email') || ''), 'expires_at': String(Math.floor(Date.now() / 1000) + 30 * 60), 'line_items[0][price_data][currency]': 'gbp', 'line_items[0][price_data][unit_amount]': String(amount), 'line_items[0][price_data][product_data][name]': String(event.get('title') || 'Ryfields Gym event ticket'), 'line_items[0][quantity]': String(quantity), ...metadata });
+    try {
+        const response = await fetch('https://api.stripe.com/v1/checkout/sessions', { method: 'POST', headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/x-www-form-urlencoded' }, body: form });
+        if (!response.ok)
+            throw new Error('Stripe Checkout could not be started.');
+        const stripeSession = await response.json();
+        await Promise.all([reservationRef.set({ stripeCheckoutSessionId: stripeSession.id, updatedAt: FieldValue.serverTimestamp() }, { merge: true }), db.collection('shopOrders').doc(stripeSession.id).set({ memberId: member.id, productId: `event:${event.id}`, productName: String(event.get('title') || 'Event ticket'), fulfilmentType: 'event_ticket', amountMinor: amount * quantity, quantity, status: 'checkout_created', provider: 'stripe', eventId: event.id, eventSessionId: sessionId, reservationId: reservationRef.id, createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() })]);
+        return { url: stripeSession.url };
+    }
+    catch (error) {
+        await db.runTransaction(async (transaction) => { const reservation = await transaction.get(reservationRef); if (reservation.get('status') === 'reserved') {
+            transaction.update(reservationRef, { status: 'released', releaseReason: 'checkout_start_failed', updatedAt: FieldValue.serverTimestamp() });
+            transaction.update(sessionRef, { reservedTickets: FieldValue.increment(-Number(reservation.get('quantity') || 1)), updatedAt: FieldValue.serverTimestamp() });
+        } });
+        throw new HttpsError('internal', error instanceof Error ? error.message : 'Stripe Checkout could not be started.');
+    }
+});
+const confirmEventCheckoutSchema = z.object({ memberId: z.string().min(1), sessionId: z.string().min(1).max(200) });
+export const confirmStripeEventCheckout = onCall({ enforceAppCheck: true }, async (request) => { if (!request.auth)
+    throw new HttpsError('unauthenticated', 'Sign-in is required.'); const parsed = confirmEventCheckoutSchema.safeParse(request.data); if (!parsed.success)
+    throw new HttpsError('invalid-argument', 'Checkout is invalid.'); const db = getFirestore(), member = await db.collection('members').doc(parsed.data.memberId).get(), orderRef = db.collection('shopOrders').doc(parsed.data.sessionId), order = await orderRef.get(); if (!member.exists || member.get('authUid') !== request.auth.uid || !order.exists || order.get('memberId') !== member.id || order.get('fulfilmentType') !== 'event_ticket')
+    throw new HttpsError('not-found', 'Event checkout not found.'); if (order.get('status') === 'paid')
+    return { status: 'paid' }; const secret = process.env.STRIPE_SECRET_KEY; if (!secret)
+    throw new HttpsError('failed-precondition', 'Stripe checkout is not configured.'); const response = await fetch(`https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(parsed.data.sessionId)}`, { headers: { Authorization: `Bearer ${secret}` } }); if (!response.ok)
+    throw new HttpsError('internal', 'Stripe payment could not be confirmed.'); const stripe = await response.json(); if (stripe.payment_status !== 'paid')
+    return { status: 'processing' }; const reservationId = String(order.get('reservationId') || stripe.metadata?.reservation_id || ''), eventSessionId = String(order.get('eventSessionId') || stripe.metadata?.event_session_id || ''), eventId = String(order.get('eventId') || stripe.metadata?.event_id || ''), reservationRef = db.collection('eventTicketReservations').doc(reservationId), sessionRef = db.collection('classSessions').doc(eventSessionId), bookingRef = sessionRef.collection('bookings').doc(member.id); await db.runTransaction(async (transaction) => { const [reservation, booking] = await Promise.all([transaction.get(reservationRef), transaction.get(bookingRef)]); if (reservation.get('status') !== 'paid') {
+    if (!reservation.exists || reservation.get('status') !== 'reserved')
+        throw new HttpsError('failed-precondition', 'This ticket reservation has expired.');
+    const quantity = Number(reservation.get('quantity') || 1), held = booking.exists && String(booking.get('status')) === 'confirmed' ? Number(booking.get('tickets') || 1) : 0;
+    transaction.update(reservationRef, { status: 'paid', stripeCheckoutSessionId: stripe.id, paidAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() });
+    transaction.update(sessionRef, { reservedTickets: FieldValue.increment(-quantity), bookedCount: FieldValue.increment(quantity), updatedAt: FieldValue.serverTimestamp() });
+    transaction.set(bookingRef, { memberId: member.id, memberName: `${member.get('firstName') || ''} ${member.get('lastName') || ''}`.trim(), memberNumber: member.get('memberNumber') || '', status: 'confirmed', position: null, usedCredit: false, paidEvent: true, tickets: held + quantity, eventId, stripeCheckoutSessionId: stripe.id, bookedAt: FieldValue.serverTimestamp(), source: 'stripe_event_return' }, { merge: true });
+} transaction.set(orderRef, { status: 'paid', paidAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() }, { merge: true }); }); await db.collection('payments').doc(String(stripe.payment_intent || stripe.id)).set({ provider: 'stripe', providerPaymentId: stripe.payment_intent || stripe.id, checkoutSessionId: stripe.id, memberId: member.id, memberName: `${member.get('firstName') || ''} ${member.get('lastName') || ''}`.trim(), amountMinor: Number(stripe.amount_total || order.get('amountMinor') || 0), currency: String(stripe.currency || 'gbp').toUpperCase(), status: 'confirmed', method: 'stripe', purpose: `event_${eventId}`, createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() }, { merge: true }); return { status: 'paid' }; });
+const productSchema = z.object({ id: z.string().max(100).optional(), name: z.string().trim().min(2).max(120), description: z.string().trim().min(5).max(1000), amountMinor: z.number().int().min(50).max(100000), imageDataUrl: z.string().regex(/^data:image\/(jpeg|png|webp);base64,/).max(950_000).nullable().optional(), fulfilmentType: z.enum(['manual', 'class_credits', 'day_pass']), category: z.enum(['class_passes', 'day_access', 'products']).default('products'), credits: z.number().int().min(0).max(100).default(0), active: z.boolean() });
+export const saveShopProduct = onCall({ enforceAppCheck: true }, async (request) => { if (!request.auth || !['staff', 'admin'].includes(String(request.auth.token.role)))
+    throw new HttpsError('permission-denied', 'Staff access is required.'); const p = productSchema.safeParse(request.data); if (!p.success)
+    throw new HttpsError('invalid-argument', 'Shop item details are invalid.'); const db = getFirestore(), ref = p.data.id ? db.collection('shopProducts').doc(p.data.id) : db.collection('shopProducts').doc(), data = { ...p.data, id: undefined, updatedAt: FieldValue.serverTimestamp(), updatedByUid: request.auth.uid, ...(p.data.id ? {} : { createdAt: FieldValue.serverTimestamp() }) }; await ref.set(data, { merge: true }); return { id: ref.id }; });
+const deleteSchema = z.object({ id: z.string().min(1).max(100) });
+export const deleteShopProduct = onCall({ enforceAppCheck: true }, async (request) => { if (!request.auth || !['staff', 'admin'].includes(String(request.auth.token.role)))
+    throw new HttpsError('permission-denied', 'Staff access is required.'); const p = deleteSchema.safeParse(request.data); if (!p.success)
+    throw new HttpsError('invalid-argument', 'Invalid shop item.'); if (['single', 'three', 'day'].includes(p.data.id))
+    throw new HttpsError('failed-precondition', 'Core passes can be hidden or edited, but not deleted.'); await getFirestore().collection('shopProducts').doc(p.data.id).delete(); return { ok: true }; });
+function requireShopStaff(request) { if (!request.auth || !['staff', 'admin'].includes(String(request.auth.token.role)))
+    throw new HttpsError('permission-denied', 'Staff access is required.'); }
+export const listShopOrders = onCall({ enforceAppCheck: true }, async (request) => {
+    requireShopStaff(request);
+    const db = getFirestore();
+    const snapshot = await db.collection('shopOrders').orderBy('updatedAt', 'desc').limit(100).get();
+    const physical = snapshot.docs.filter(order => order.get('fulfilmentType') === 'manual' && order.get('status') === 'paid');
+    const memberIds = [...new Set(physical.map(order => String(order.get('memberId') || '')).filter(Boolean))];
+    const members = await Promise.all(memberIds.map(id => db.collection('members').doc(id).get()));
+    const names = new Map(members.map(member => [member.id, `${member.get('firstName') || ''} ${member.get('lastName') || ''}`.trim()]));
+    return { orders: physical.map(order => ({
+            id: order.id,
+            productId: String(order.get('productId') || ''),
+            productName: String(order.get('productName') || 'Physical product'),
+            memberId: String(order.get('memberId') || ''),
+            memberName: names.get(String(order.get('memberId') || '')) || 'Member',
+            amountMinor: Number(order.get('amountMinor') || 0),
+            fulfilmentStatus: String(order.get('fulfilmentStatus') || 'ordered'),
+            paidAt: order.get('paidAt')?.toDate?.().toISOString?.() || null,
+            updatedAt: order.get('updatedAt')?.toDate?.().toISOString?.() || null,
+        })) };
+});
+const fulfilmentStatusSchema = z.object({ orderId: z.string().min(1).max(200), status: z.enum(['ordered', 'ready', 'delivered']) });
+export const updateShopOrderStatus = onCall({ enforceAppCheck: true }, async (request) => { requireShopStaff(request); const parsed = fulfilmentStatusSchema.safeParse(request.data); if (!parsed.success)
+    throw new HttpsError('invalid-argument', 'Invalid shop order update.'); const ref = getFirestore().collection('shopOrders').doc(parsed.data.orderId), order = await ref.get(); if (!order.exists || order.get('fulfilmentType') !== 'manual' || order.get('status') !== 'paid')
+    throw new HttpsError('not-found', 'Physical shop order not found.'); await ref.set({ fulfilmentStatus: parsed.data.status, fulfilmentUpdatedAt: FieldValue.serverTimestamp(), fulfilmentUpdatedByUid: request.auth.uid, updatedAt: FieldValue.serverTimestamp(), ...(parsed.data.status === 'ready' ? { readyAt: FieldValue.serverTimestamp() } : { readyAt: null }), ...(parsed.data.status === 'delivered' ? { deliveredAt: FieldValue.serverTimestamp() } : { deliveredAt: null }) }, { merge: true }); return { ok: true, status: parsed.data.status }; });

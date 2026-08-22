@@ -1,0 +1,1 @@
+export type MembershipType={id:string;name:string;description:string;priceMinor:number;currency:'GBP';billingInterval:'monthly'|'annual';active:boolean;classAccessPolicy:'all'|'gym_only'|'classes_only'|'weekly_class'}

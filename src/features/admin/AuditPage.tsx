@@ -1,0 +1,8 @@
+import { ArrowLeft,ShieldCheck } from 'lucide-react'
+import { collection,limit,onSnapshot,orderBy,query } from 'firebase/firestore'
+import { useEffect,useState } from 'react'
+import { Link } from 'react-router-dom'
+import { db,firebaseConfigured } from '../../lib/firebase'
+type Audit={id:string;actorUid:string;action:string;entityType:string;entityId:string;occurredAt?:Date}
+const demo:Audit[]=[{id:'1',actorUid:'admin',action:'member.update',entityType:'member',entityId:'member-a',occurredAt:new Date()},{id:'2',actorUid:'system',action:'membership.status.change',entityType:'member',entityId:'member-b',occurredAt:new Date(Date.now()-3600000)}]
+export function AuditPage(){const[items,setItems]=useState(demo);useEffect(()=>{if(!firebaseConfigured)return;return onSnapshot(query(collection(db,'auditLogs'),orderBy('occurredAt','desc'),limit(200)),snapshot=>setItems(snapshot.docs.map(item=>{const data=item.data();return{id:item.id,...data,occurredAt:data.occurredAt?.toDate()} as Audit})))},[]);return <><header className="page-head"><div><p className="eyebrow">Administration</p><h1>Audit log</h1><p>Append-only record of sensitive staff and system actions.</p></div><Link className="secondary" to="/reports"><ArrowLeft/> Back to reports</Link></header><article className="panel audit-table"><div className="audit-head"><span>Action</span><span>Entity</span><span>Actor</span><span>When</span></div>{items.map(item=><div className="audit-row" key={item.id}><span><ShieldCheck/><strong>{item.action}</strong></span><span>{item.entityType} · {item.entityId}</span><code>{item.actorUid}</code><time>{item.occurredAt?.toLocaleString('en-GB')||'Processing'}</time></div>)}</article></>}

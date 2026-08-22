@@ -1,0 +1,117 @@
+import { FieldValue, getFirestore, Timestamp } from 'firebase-admin/firestore';
+import { HttpsError, onCall } from 'firebase-functions/v2/https';
+import { z } from 'zod';
+import { requireClassStaff, requireStaff } from '../shared/auth.js';
+import { chooseBookingPlacement } from '../domain/booking.js';
+const bookingSchema = z.object({ sessionId: z.string().min(1), memberId: z.string().min(1) });
+const cancelSchema = z.object({ sessionId: z.string().min(1), memberId: z.string().min(1), reason: z.string().trim().max(200).optional() });
+const sessionSchema = z.object({ name: z.string().trim().min(2).max(120), startsAt: z.number().int().positive(), endsAt: z.number().int().positive(), location: z.string().trim().min(1).max(120), instructorNames: z.array(z.string().trim().min(1).max(100)).min(1).max(10), capacity: z.number().int().min(1).max(500), bookingOpenDays: z.number().int().min(0).max(90).default(14), cancellationCutoffMinutes: z.number().int().min(0).max(10080).default(120) });
+const cancelSessionSchema = z.object({ sessionId: z.string().min(1), reason: z.string().trim().min(2).max(200).default('Staff timetable change') });
+async function authoriseMember(request, memberId) { if (!request.auth)
+    throw new HttpsError('unauthenticated', 'Sign-in is required.'); const member = await getFirestore().collection('members').doc(memberId).get(); if (!member.exists)
+    throw new HttpsError('not-found', 'Member not found.'); const staff = ['staff', 'admin'].includes(String(request.auth.token.role)); if (member.get('authUid') !== request.auth.uid && !staff)
+    throw new HttpsError('permission-denied', 'You cannot manage this booking.'); return member; }
+export const saveClassSession = onCall({ enforceAppCheck: true }, async (request) => { requireStaff(request); const parsed = sessionSchema.safeParse(request.data); if (!parsed.success || parsed.data.endsAt <= parsed.data.startsAt)
+    throw new HttpsError('invalid-argument', 'Class details are invalid.'); const data = parsed.data, ref = getFirestore().collection('classSessions').doc(), startsAt = Timestamp.fromMillis(data.startsAt); await ref.create({ nameSnapshot: data.name, startsAt, endsAt: Timestamp.fromMillis(data.endsAt), locationSnapshot: data.location, instructorNames: data.instructorNames, capacity: data.capacity, bookedCount: 0, waitlistCount: 0, status: 'scheduled', bookingOpensAt: Timestamp.fromMillis(data.startsAt - data.bookingOpenDays * 86400000), bookingClosesAt: startsAt, cancellationCutoffAt: Timestamp.fromMillis(data.startsAt - data.cancellationCutoffMinutes * 60000), createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() }); return { id: ref.id }; });
+export const cancelClassSession = onCall({ enforceAppCheck: true }, async (request) => { requireStaff(request); const parsed = cancelSessionSchema.safeParse(request.data); if (!parsed.success)
+    throw new HttpsError('invalid-argument', 'Class cancellation is invalid.'); const db = getFirestore(), sessionRef = db.collection('classSessions').doc(parsed.data.sessionId); return db.runTransaction(async (transaction) => { const session = await transaction.get(sessionRef); if (!session.exists)
+    throw new HttpsError('not-found', 'Class not found.'); if (session.get('status') === 'cancelled')
+    return { refunded: 0 }; const bookings = await transaction.get(sessionRef.collection('bookings')); const active = bookings.docs.filter(item => ['confirmed', 'waitlisted'].includes(String(item.get('status')))); if (active.length > 200)
+    throw new HttpsError('resource-exhausted', 'This class has too many bookings to cancel automatically.'); const creditBookings = active.filter(item => item.get('usedCredit') === true), memberRefs = creditBookings.map(item => db.collection('members').doc(String(item.get('memberId') || item.id))), members = memberRefs.length ? await transaction.getAll(...memberRefs) : []; transaction.update(sessionRef, { status: 'cancelled', cancelledAt: FieldValue.serverTimestamp(), cancelledByUid: request.auth.uid, cancelReason: parsed.data.reason, bookedCount: 0, waitlistCount: 0, updatedAt: FieldValue.serverTimestamp() }); for (const item of active)
+    transaction.update(item.ref, { status: 'cancelled', cancelledAt: FieldValue.serverTimestamp(), cancelReason: parsed.data.reason, cancelledByStaff: true, creditForfeited: false }); members.forEach(member => { if (member.exists)
+    transaction.update(member.ref, { classCredits: Math.min(50, Number(member.get('classCredits') || 0) + 1), updatedAt: FieldValue.serverTimestamp() }); }); return { refunded: members.filter(item => item.exists).length }; }); });
+export const bookClass = onCall({ enforceAppCheck: true }, async (request) => { const parsed = bookingSchema.safeParse(request.data); if (!parsed.success)
+    throw new HttpsError('invalid-argument', 'Booking is invalid.'); const member = await authoriseMember(request, parsed.data.memberId); if (!['active', 'payment_failed'].includes(String(member.get('membershipStatus'))))
+    throw new HttpsError('failed-precondition', 'An active membership is required.'); const db = getFirestore(), typeId = String(member.get('membershipTypeId') || ''), typeSnap = typeId ? await db.collection('membershipTypes').doc(typeId).get() : null, policy = typeSnap?.exists ? String(typeSnap.get('classAccessPolicy') || 'all') : ''; const usesCredits = !(policy === 'all' || policy === 'classes_only'), memberRef = db.collection('members').doc(parsed.data.memberId), sessionRef = db.collection('classSessions').doc(parsed.data.sessionId), bookingRef = sessionRef.collection('bookings').doc(parsed.data.memberId); return db.runTransaction(async (transaction) => { const [session, booking, memberSnap] = await Promise.all([transaction.get(sessionRef), transaction.get(bookingRef), transaction.get(memberRef)]); if (!session.exists)
+    throw new HttpsError('not-found', 'Class not found.'); if (booking.exists && ['confirmed', 'waitlisted', 'attended'].includes(booking.get('status')))
+    throw new HttpsError('already-exists', 'This member already has a booking.'); if (session.get('status') !== 'scheduled')
+    throw new HttpsError('failed-precondition', 'This class is not open.'); const now = Timestamp.now(), opens = session.get('bookingOpensAt'), closes = session.get('bookingClosesAt'); if (opens && now.toMillis() < opens.toMillis())
+    throw new HttpsError('failed-precondition', 'Bookings are not open yet.'); if (closes && now.toMillis() > closes.toMillis())
+    throw new HttpsError('failed-precondition', 'Bookings have closed.'); const chargeCredit = usesCredits && session.get('creditExempt') !== true; if (chargeCredit) {
+    const credits = Number(memberSnap.get('classCredits') || 0);
+    if (credits < 1)
+        throw new HttpsError('resource-exhausted', 'You’ve no class passes left right now — your next one lands Sunday at 6pm. You can grab a class pass pack from the shop, or upgrade to Gym Plus for unlimited classes.');
+    transaction.update(memberRef, { classCredits: credits - 1, updatedAt: FieldValue.serverTimestamp() });
+} const booked = Number(session.get('bookedCount') || 0), capacity = Number(session.get('capacity') || 0), placement = chooseBookingPlacement(booked, capacity, Number(session.get('waitlistCount') || 0)), { status, position } = placement; transaction.set(bookingRef, { memberId: parsed.data.memberId, memberName: `${member.get('firstName')} ${member.get('lastName')}`, memberNumber: member.get('memberNumber'), status, position, usedCredit: chargeCredit, bookedAt: FieldValue.serverTimestamp(), source: 'portal' }); transaction.update(sessionRef, { [status === 'waitlisted' ? 'waitlistCount' : 'bookedCount']: FieldValue.increment(1), updatedAt: FieldValue.serverTimestamp() }); return { status, position }; }); });
+export const cancelClassBooking = onCall({ enforceAppCheck: true }, async (request) => {
+    const parsed = cancelSchema.safeParse(request.data);
+    if (!parsed.success)
+        throw new HttpsError('invalid-argument', 'Booking is invalid.');
+    await authoriseMember(request, parsed.data.memberId);
+    const db = getFirestore(), memberRef = db.collection('members').doc(parsed.data.memberId), sessionRef = db.collection('classSessions').doc(parsed.data.sessionId), bookingRef = sessionRef.collection('bookings').doc(parsed.data.memberId);
+    return db.runTransaction(async (transaction) => {
+        const waitingQuery = sessionRef.collection('bookings').where('status', '==', 'waitlisted');
+        const [session, booking, memberSnap, waiting] = await Promise.all([transaction.get(sessionRef), transaction.get(bookingRef), transaction.get(memberRef), transaction.get(waitingQuery)]);
+        if (!session.exists || !booking.exists)
+            throw new HttpsError('not-found', 'Booking not found.');
+        const status = booking.get('status');
+        if (!['confirmed', 'waitlisted'].includes(status))
+            throw new HttpsError('failed-precondition', 'This booking cannot be cancelled.');
+        const startsMs = session.get('startsAt')?.toMillis() || 0, nowMs = Timestamp.now().toMillis();
+        if (startsMs && nowMs > startsMs)
+            throw new HttpsError('failed-precondition', 'This class has already started.');
+        const within12h = startsMs > 0 && startsMs - nowMs < 12 * 3600000, usedCredit = !!booking.get('usedCredit'), refund = usedCredit && (status === 'waitlisted' || !within12h), forfeit = usedCredit && status === 'confirmed' && within12h;
+        if (refund && memberSnap.exists)
+            transaction.update(memberRef, { classCredits: Math.min(50, Number(memberSnap.get('classCredits') || 0) + 1), updatedAt: FieldValue.serverTimestamp() });
+        transaction.update(bookingRef, { status: 'cancelled', cancelledAt: FieldValue.serverTimestamp(), cancelReason: parsed.data.reason || null, cancelWithin12h: within12h, creditForfeited: forfeit });
+        if (status === 'waitlisted') {
+            transaction.update(sessionRef, { waitlistCount: FieldValue.increment(-1) });
+            return { promotedMemberId: null, forfeited: false };
+        }
+        // Sort waitlist in memory (avoids a composite index on status+position).
+        const next = waiting.docs.slice().sort((a, b) => Number(a.get('position') || 0) - Number(b.get('position') || 0))[0];
+        if (next) {
+            transaction.update(next.ref, { status: 'confirmed', position: null, promotedAt: FieldValue.serverTimestamp() });
+            transaction.update(sessionRef, { waitlistCount: FieldValue.increment(-1) });
+        }
+        else
+            transaction.update(sessionRef, { bookedCount: FieldValue.increment(-1) });
+        return { promotedMemberId: next?.id || null, forfeited: forfeit };
+    });
+});
+const attendanceSchema = z.object({ sessionId: z.string().min(1), memberId: z.string().min(1), attended: z.boolean().nullable() });
+export const markClassAttendance = onCall({ enforceAppCheck: true }, async (request) => {
+    requireClassStaff(request);
+    const parsed = attendanceSchema.safeParse(request.data);
+    if (!parsed.success)
+        throw new HttpsError('invalid-argument', 'Attendance is invalid.');
+    const db = getFirestore(), sessionRef = db.collection('classSessions').doc(parsed.data.sessionId), bookingRef = sessionRef.collection('bookings').doc(parsed.data.memberId), attendanceRef = sessionRef.collection('attendance').doc(parsed.data.memberId), memberRef = db.collection('members').doc(parsed.data.memberId);
+    await db.runTransaction(async (transaction) => {
+        const [booking, session, member, existingVisits] = await Promise.all([
+            transaction.get(bookingRef), transaction.get(sessionRef), transaction.get(memberRef),
+            transaction.get(db.collection('visits').where('memberId', '==', parsed.data.memberId).where('classSessionIds', 'array-contains', parsed.data.sessionId).limit(1)),
+        ]);
+        if (!booking.exists)
+            throw new HttpsError('not-found', 'Booking not found.');
+        if (parsed.data.attended === null) {
+            transaction.delete(attendanceRef);
+            transaction.update(bookingRef, { status: 'confirmed' });
+            return;
+        }
+        transaction.set(attendanceRef, { memberId: parsed.data.memberId, attended: parsed.data.attended, markedByUid: request.auth.uid, markedAt: FieldValue.serverTimestamp(), method: 'register' });
+        transaction.update(bookingRef, { status: parsed.data.attended ? 'attended' : 'no_show' });
+        // Only for people who actually turned up, and only if the door did not
+        // already record them — marking the register twice must not double-count.
+        if (parsed.data.attended && existingVisits.empty && member.exists) {
+            const startsAt = session.get('startsAt'), checkedInAt = startsAt && startsAt.toMillis() < Date.now() ? startsAt : Timestamp.now();
+            transaction.create(db.collection('visits').doc(), { memberId: parsed.data.memberId, authUid: member.get('authUid') || null,
+                memberName: `${member.get('firstName') || ''} ${member.get('lastName') || ''}`.trim(),
+                locationId: 'main', method: 'register', entitlement: 'class_booking', visitType: 'class', classSessionIds: [parsed.data.sessionId],
+                countsTowardOccupancy: false, checkedInAt, scheduledCheckoutAt: Timestamp.fromMillis(checkedInAt.toMillis() + 3_600_000),
+                checkedOutAt: null, checkoutReason: null, checkedInByUid: request.auth.uid, createdAt: FieldValue.serverTimestamp() });
+        }
+    });
+    return { ok: true };
+});
+const staffCancelBookingSchema = z.object({ sessionId: z.string().min(1), memberId: z.string().min(1), refundCredit: z.boolean() });
+export const staffCancelClassBooking = onCall({ enforceAppCheck: true }, async (request) => { requireClassStaff(request); const parsed = staffCancelBookingSchema.safeParse(request.data); if (!parsed.success)
+    throw new HttpsError('invalid-argument', 'Booking cancellation is invalid.'); const db = getFirestore(), sessionRef = db.collection('classSessions').doc(parsed.data.sessionId), bookingRef = sessionRef.collection('bookings').doc(parsed.data.memberId), memberRef = db.collection('members').doc(parsed.data.memberId), attendanceRef = sessionRef.collection('attendance').doc(parsed.data.memberId); return db.runTransaction(async (transaction) => { const waitingQuery = sessionRef.collection('bookings').where('status', '==', 'waitlisted'); const [session, booking, member, waiting] = await Promise.all([transaction.get(sessionRef), transaction.get(bookingRef), transaction.get(memberRef), transaction.get(waitingQuery)]); if (!session.exists || !booking.exists)
+    throw new HttpsError('not-found', 'Booking not found.'); const status = String(booking.get('status')); if (!['confirmed', 'attended', 'no_show'].includes(status))
+    throw new HttpsError('failed-precondition', 'This booking cannot be cancelled from the register.'); const usedCredit = booking.get('usedCredit') === true, refund = parsed.data.refundCredit && usedCredit && member.exists; if (refund)
+    transaction.update(memberRef, { classCredits: Math.min(50, Number(member.get('classCredits') || 0) + 1), updatedAt: FieldValue.serverTimestamp() }); transaction.update(bookingRef, { status: 'cancelled', cancelledAt: FieldValue.serverTimestamp(), cancelledByStaff: true, cancelReason: 'Removed from class register', creditForfeited: usedCredit && !refund, creditRefunded: refund }); transaction.delete(attendanceRef); const next = status === 'confirmed' ? waiting.docs.slice().sort((a, b) => Number(a.get('position') || 0) - Number(b.get('position') || 0))[0] : undefined; if (next) {
+    transaction.update(next.ref, { status: 'confirmed', position: null, promotedAt: FieldValue.serverTimestamp() });
+    transaction.update(sessionRef, { waitlistCount: FieldValue.increment(-1), updatedAt: FieldValue.serverTimestamp() });
+}
+else
+    transaction.update(sessionRef, { bookedCount: FieldValue.increment(-1), updatedAt: FieldValue.serverTimestamp() }); return { refunded: refund, promotedMemberId: next?.id || null }; }); });
+import '../config.js';

@@ -1,0 +1,13 @@
+{
+  "name": "ryfields-functions",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "engines": { "node": "22" },
+  "pnpm": {
+    "onlyBuiltDependencies": ["@firebase/util", "protobufjs"]
+  },
+  "scripts": { "build": "tsc", "test": "vitest run", "seed:staging": "node scripts/seed-staging.mjs", "migrate:members": "node scripts/migrate-members.mjs" },
+  "dependencies": { "firebase-admin": "latest", "firebase-functions": "latest", "zod": "latest" },
+  "devDependencies": { "typescript": "latest", "vitest": "latest" }
+}

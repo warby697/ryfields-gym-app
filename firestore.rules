@@ -1,0 +1,67 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function role() { return signedIn() ? request.auth.token.role : null; }
+    function isStaff() { return role() in ['staff', 'admin']; }
+    function isAdmin() { return role() == 'admin'; }
+    function isClassStaff() { return role() in ['instructor', 'staff', 'admin']; }
+    function memberId() { return signedIn() ? request.auth.token.memberId : null; }
+    match /members/{id} {
+      allow read: if isStaff() || (signedIn() && resource.data.authUid == request.auth.uid);
+      allow write: if false;
+      match /notes/{noteId} { allow read: if isStaff(); allow write: if false; }
+      match /statusHistory/{eventId} { allow read: if isStaff(); allow write: if false; }
+    }
+    match /membershipTypes/{id} { allow read: if signedIn(); allow write: if false; }
+    match /classSessions/{id} {
+      allow read: if signedIn(); allow write: if false;
+      match /bookings/{bookingMemberId} {
+        allow read: if isClassStaff() || memberId() == bookingMemberId;
+        allow write: if false;
+      }
+      match /attendance/{attendanceMemberId} {
+        allow read: if isClassStaff() || memberId() == attendanceMemberId;
+        allow write: if false;
+      }
+    }
+    match /visits/{id} {
+      allow read: if isStaff() || (signedIn() && resource.data.memberId == memberId());
+      allow write: if false;
+    }
+    match /payments/{id} {
+      allow read: if isStaff() || (signedIn() && resource.data.memberId == memberId());
+      allow write: if false;
+    }
+    match /auditLogs/{id} { allow read: if isAdmin(); allow write: if false; }
+    match /mandates/{id} { allow read: if isStaff() || (signedIn() && resource.data.memberId == memberId()); allow write: if false; }
+    match /subscriptions/{id} { allow read: if isStaff() || (signedIn() && resource.data.memberId == memberId()); allow write: if false; }
+    match /locations/{id} { allow read: if signedIn(); allow write: if false; }
+    match /classTemplates/{id} { allow read: if isClassStaff(); allow write: if false; }
+    match /checkInDisplays/{id} { allow read: if isStaff(); allow write: if false; }
+    match /noticeBoard/{id} { allow read: if signedIn(); allow write: if false; }
+    match /events/{id} { allow read: if signedIn(); allow write: if false; }
+    match /sessionFeedback/{id} { allow read: if isStaff() || (signedIn() && resource.data.memberId == memberId()); allow write: if false; }
+    match /busyTimes/{id} { allow read: if signedIn(); allow write: if false; }
+    match /checkInFailures/{id} { allow read: if isStaff(); allow write: if false; }
+    // The check-in tablet greets people by first name; it is not staff, so it
+    // gets this one doc rather than read access to every visit.
+    match /checkInFeed/{id} { allow read: if isStaff() || role() == 'kiosk'; allow write: if false; }
+    match /gymStatus/{id} { allow read: if signedIn(); allow write: if false; }
+    match /{path=**}/bookings/{bookingMemberId} {
+      allow read: if isClassStaff() || resource.data.memberId == memberId();
+      allow write: if false;
+    }
+    match /dailyMetrics/{id} { allow read: if isStaff(); allow write: if false; }
+    match /reportSnapshots/{id} { allow read: if isStaff(); allow write: if false; }
+    match /emailTemplates/{id} { allow read: if isStaff(); allow write: if false; }
+    match /cashImportWorkspaces/{uid} {
+      allow read, write: if isAdmin() && request.auth.uid == uid;
+      match /months/{month} {
+        allow read, write: if isAdmin() && request.auth.uid == uid;
+      }
+    }
+    match /shopProducts/{id} { allow read: if signedIn(); allow write: if false; }
+    match /{document=**} { allow read, write: if false; }
+  }
+}

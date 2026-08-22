@@ -1,0 +1,2 @@
+legacyId,memberNumber,firstName,lastName,email,phone,membershipTypeId,membershipStatus,gocardlessCustomerId,gocardlessMandateId,gocardlessSubscriptionId
+,RYF-1001,Example,Member,example@example.com,07700900000,full,active,,,

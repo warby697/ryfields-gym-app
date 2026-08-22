@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+.env.local
+firebase-debug.log
+work/.npm-cache/
+work/.pnpm-store/
+.netlify/
+.secrets/
+*service-account*.json
+firebase-admin-key*.json
+.tools/
+*.log
+*.out.log
+*.err.log

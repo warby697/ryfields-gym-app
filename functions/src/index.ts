@@ -1,0 +1,22 @@
+import './config.js'
+import { cert, getApps, initializeApp } from 'firebase-admin/app'
+const projectId=process.env.FIREBASE_ADMIN_PROJECT_ID,clientEmail=process.env.FIREBASE_ADMIN_CLIENT_EMAIL,privateKey=process.env.FIREBASE_ADMIN_PRIVATE_KEY?.replace(/\\n/g,'\n')
+if(!getApps().length)initializeApp(projectId&&clientEmail&&privateKey?{credential:cert({projectId,clientEmail,privateKey})}:undefined)
+export { acknowledgeCancellation,addMemberNote,claimMembership,completeRegistration,createFreeAccount,createMember,dismissAppWelcome,grantClassCredits,linkMemberAccount,selectMembershipPlan,setMemberChecked,setMemberJourney,updateGoalProgress,updateMember,updateOwnProfile } from './callable/members.js'
+export { changeMembershipStatus, saveMembershipType } from './callable/memberships.js'
+export { recordCashPayment, setCashSchedule } from './callable/cash.js'
+export { startDirectDebit } from './callable/directDebit.js'
+// GoCardless exports are enabled during the dedicated payment deployment once
+// sandbox credentials have been stored in Secret Manager.
+export { bookClass, cancelClassBooking, cancelClassSession, markClassAttendance, saveClassSession, staffCancelClassBooking } from './callable/classes.js'
+export { createCheckInChallenge, memberCheckIn, searchCheckInMembers, staffCheckIn } from './callable/checkin.js'
+export { autoCheckoutVisits } from './scheduled/visits.js'
+export { aggregateDailyMetrics } from './scheduled/metrics.js'
+export { editClassTemplate, saveClassTemplate } from './callable/classTemplates.js'
+export { saveEvent,deleteEvent } from './callable/events.js'
+export { submitSessionFeedback } from './callable/feedback.js'
+export { gymOccupancy } from './callable/stats.js'
+export { queueUrgentBroadcast,saveEmailTemplate,sendTemplateEmail } from './callable/emailTemplates.js'
+export { confirmStripeEventCheckout,createStripeEventCheckout,createStripeShopCheckout,getStripeShopOrderStatus,previewGymPlusUpgrade,saveShopProduct,deleteShopProduct,listShopOrders,updateShopOrderStatus } from './callable/shop.js'
+export { generateClassSessions } from './scheduled/classes.js'
+export { aggregateOperationalReports } from './scheduled/operationalReports.js'

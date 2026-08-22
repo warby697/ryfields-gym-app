@@ -1,0 +1,2 @@
+export function chooseBookingPlacement(bookedCount, capacity, waitlistCount) { if (!Number.isInteger(bookedCount) || !Number.isInteger(capacity) || !Number.isInteger(waitlistCount) || bookedCount < 0 || capacity < 1 || waitlistCount < 0)
+    throw new Error('Invalid capacity values'); const waitlisted = bookedCount >= capacity; return { status: waitlisted ? 'waitlisted' : 'confirmed', position: waitlisted ? waitlistCount + 1 : null }; }
